@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Visor vial | Corredor</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><style>body{font-family:system-ui,Arial;margin:0;background:#f4f6f8;color:#18283b}header{background:#173652;color:white;padding:16px 24px}.corridor-meta{margin-top:7px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:.92rem}.corridor-code{background:#ffffff24;border:1px solid #ffffff55;border-radius:5px;padding:3px 9px;font-weight:700}h1{font-size:1.3rem;margin:0}main{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:14px}.panel{background:white;border-radius:10px;padding:14px;box-shadow:0 1px 5px #0002}video{width:100%;background:#111;max-height:60vh}#map{height:60vh;min-height:350px;border-radius:8px}input[type=range]{width:100%}.tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}.tools button{background:#173652;color:white;border:0;border-radius:6px;padding:9px 12px;cursor:pointer}.tools label{font-size:.9rem}.stats{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:12px}.muted{color:#526479;font-size:.9rem}#status{padding:10px 14px;color:#854d0e}@media(max-width:800px){main{grid-template-columns:1fr}#map{height:400px}}.pr-label{font-weight:700;color:#143b5b;background:#ffffffee;border:1px solid #9cb3c8;box-shadow:0 1px 3px #0002}.pr-label:before{border-top-color:#ffffffee!important}</style></head><body><header><h1 id="corridor-title">Recorrido georreferenciado</h1><div class="corridor-meta"><span class="corridor-code" id="corridor-code">Cargando código…</span><span id="corridor-range">Cargando abscisas…</span></div></header><main><section class="panel"><h2>Video del recorrido</h2><video id="video" controls muted preload="metadata" src="videos/recorrido.mp4"></video><label for="slider">Posición del recorrido</label><input id="slider" type="range" min="0" max="1000" value="0" step="1"><div class="stats"><strong id="time">00:00 / 00:00</strong><strong id="chainage">K15+860</strong><span id="distance">0,00 km</span><span id="control-info">Control: K21+000 · 09:51</span></div><div class="tools"><label><input type="checkbox" id="reverse"> Invertir sentido del eje</label><label><input type="checkbox" id="follow"> Seguir marcador en el mapa</label><button type="button" id="reset">Volver al inicio</button></div><p class="muted">Versión portable: abre <code>index.html</code> con doble clic. La búsqueda en el video depende de la compatibilidad del navegador con MP4 locales. Sentido del video: Cañasgordas → Abriaquí. Comprueba visualmente que el punto de inicio del eje coincida con el inicio real del video. Sin GPS: sincronización lineal por tramos entre el inicio, los puntos de control y el final. Las posiciones intermedias son estimadas, no mediciones GPS. Los puntos de control se definen en configuracion.js.</p></section><section class="panel"><h2>Eje vial y posición estimada</h2><div id="map"></div><p class="muted">Haz clic sobre la línea para saltar a esa posición del video. Los PR 16 a 25 se muestran en su ubicación geográfica real y pueden ocultarse desde el control de capas.</p></section></main><div id="status" role="status">Cargando geometría vial…</div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script><script src="configuracion.js"></script><script src="datos/eje_vial.js"></script><script src="datos/prs.js"></script><script>
+const video=document.querySelector('#video'),slider=document.querySelector('#slider'),time=document.querySelector('#time'),chainage=document.querySelector('#chainage'),distance=document.querySelector('#distance'),status=document.querySelector('#status');
+// Audio deshabilitado permanentemente sin alterar el archivo MP4.
+video.muted = true;
+video.volume = 0;
+video.addEventListener('volumechange', () => {
+  if (!video.muted) video.muted = true;
+  if (video.volume !== 0) video.volume = 0;
+});
+const map=L.map('map').setView([6.7,-76.1],10);L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Tiles &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community'}).addTo(map);
+let route=null,totalKm=0,marker=null,routeLayer=null,ends=[],prLayer=null;let config=null;let pendingSeek=null,seekTimer=null;let lastMapFollow=0;const follow=document.querySelector("#follow");const reverse=document.querySelector("#reverse");try{reverse.checked=localStorage.getItem("reverseRoute")==="true";}catch(e){reverse.checked=false;}
+const clock=s=>{if(!Number.isFinite(s))return '00:00';let v=Math.floor(s);return `${String(Math.floor(v/60)).padStart(2,'0')}:${String(v%60).padStart(2,'0')}`};
+function abscisa(m){let n=Math.round(m);return `K${Math.floor(n/1000)}+${String(n%1000).padStart(3,'0')}`;}
+function controles(){
+ const dur=video.duration;
+ if(!Number.isFinite(dur)||dur<=0)return null;
+ const internos=config.puntos_control||[];
+ if(internos.some(c=>c.tiempo_segundos>=dur))return null;
+ return [{tiempo_segundos:0,abscisa_m:config.abscisa_inicio_m},...internos,{tiempo_segundos:dur,abscisa_m:config.abscisa_fin_m}];
+}
+function interpolar(x,pares,claveX,claveY){
+ if(x<=pares[0][claveX])return pares[0][claveY];
+ for(let i=1;i<pares.length;i++){
+  if(x<=pares[i][claveX]){
+   const a=pares[i-1],b=pares[i];
+   return a[claveY]+(x-a[claveX])*(b[claveY]-a[claveY])/(b[claveX]-a[claveX]);
+  }
+ }
+ return pares[pares.length-1][claveY];
+}
+function abscisaEn(p){
+ const c=controles();
+ return c?interpolar(p*video.duration,c,'tiempo_segundos','abscisa_m'):config.abscisa_inicio_m+(config.abscisa_fin_m-config.abscisa_inicio_m)*p;
+}
+function proporcionEnAbscisa(m){
+ const c=controles();
+ return c?interpolar(m,c,'abscisa_m','tiempo_segundos')/video.duration:(m-config.abscisa_inicio_m)/(config.abscisa_fin_m-config.abscisa_inicio_m);
+}
+function avanceGeografico(p){return (abscisaEn(p)-config.abscisa_inicio_m)/(config.abscisa_fin_m-config.abscisa_inicio_m);}
+
+function render(p){p=Math.max(0,Math.min(1,p));if(pendingSeek===null)slider.value=Math.round(p*1000);time.textContent=`${clock(pendingSeek===null?video.currentTime:p*video.duration)} / ${clock(video.duration)}`;if(!route)return;let km=avanceGeografico(p)*totalKm,pt=turf.along(route,reverse.checked?totalKm-km:km,{units:'kilometers'});marker.setLatLng([pt.geometry.coordinates[1],pt.geometry.coordinates[0]]);chainage.textContent=abscisa(abscisaEn(p));distance.textContent=`${km.toFixed(2).replace('.',',')} km`;if(follow.checked && performance.now()-lastMapFollow>500 && !map.getBounds().pad(-0.2).contains(marker.getLatLng())){map.panTo(marker.getLatLng(),{animate:true,duration:0.4});lastMapFollow=performance.now();}}
+function updateEnds(){if(ends.length!==2)return;ends[reverse.checked?1:0].bindTooltip(abscisa(config.abscisa_inicio_m),{permanent:true,direction:'top'});ends[reverse.checked?0:1].bindTooltip(abscisa(config.abscisa_fin_m),{permanent:true,direction:'top'});ends.forEach(x=>x.closeTooltip());ends.forEach(x=>x.openTooltip());}
+reverse.addEventListener('change',()=>{try{localStorage.setItem('reverseRoute',String(reverse.checked));}catch(e){}updateEnds();render(position())});document.querySelector('#reset').addEventListener('click',()=>{seekTo(0)});
+function position(){return Number.isFinite(video.duration)&&video.duration>0?video.currentTime/video.duration:0}
+function animationLoop(){if(pendingSeek===null&&!video.paused&&!video.ended)render(position());requestAnimationFrame(animationLoop)}requestAnimationFrame(animationLoop);
+video.addEventListener('timeupdate',()=>{if(pendingSeek===null)render(position())});
+video.addEventListener('loadedmetadata',()=>{if(pendingSeek!==null){seekTo(pendingSeek);return;}if(config&&config.puntos_control&&config.puntos_control.some(c=>c.tiempo_segundos>=video.duration)){status.textContent='Error: el punto de control debe estar antes del final del video ('+clock(video.duration)+').';return;}if(pendingSeek===null)render(position())});
+video.addEventListener('seeked',()=>{if(pendingSeek!==null && Math.abs(video.currentTime-pendingSeek*video.duration)<Math.max(1,video.duration/1000)){pendingSeek=null;clearTimeout(seekTimer);status.textContent='Salto completado. Sincronización calibrada por puntos de control.';render(position())}});
+video.addEventListener('ended',()=>{pendingSeek=null;render(1)});
+function seekTo(p){
+ p=Math.max(0,Math.min(1,p));pendingSeek=p;slider.value=Math.round(p*1000);render(p);
+ if(!Number.isFinite(video.duration)||video.duration<=0){status.textContent='Esperando que el navegador cargue la duración del video…';return}
+ const target=Math.min(p*video.duration,Math.max(0,video.duration-0.05));
+ try{video.currentTime=target;status.textContent='Buscando posición '+clock(target)+'…';}
+ catch(err){status.textContent='No se pudo adelantar el MP4: '+err.message;console.error(err)}
+ clearTimeout(seekTimer);
+ seekTimer=setTimeout(()=>{if(pendingSeek!==null){status.textContent='El video no confirmó el salto. Algunos navegadores no permiten buscar dentro de ciertos MP4 abiertos desde archivos locales. Prueba Chrome o Edge; si persiste, se necesitará una versión con servidor o empaquetada.';}},4500);
+}
+slider.addEventListener('input',()=>seekTo(Number(slider.value)/1000));
+async function init(){try{
+config=window.VISOR_CONFIG;
+if(!config)throw Error('No se pudo cargar configuracion.js');
+if(!Number.isSafeInteger(config.abscisa_inicio_m)||!Number.isSafeInteger(config.abscisa_fin_m)||config.abscisa_inicio_m<0||config.abscisa_fin_m<=config.abscisa_inicio_m)throw Error('configuracion.js debe tener abscisa_inicio_m y abscisa_fin_m como enteros positivos, y el final debe ser mayor que el inicio.');
+if(typeof config.codigo_via!=='string'||!config.codigo_via.trim()||typeof config.nombre_corredor!=='string'||!config.nombre_corredor.trim())throw Error('configuracion.js debe incluir codigo_via y nombre_corredor como textos no vacíos.');
+if(!Array.isArray(config.color_eje_rgb)||config.color_eje_rgb.length!==3||!config.color_eje_rgb.every(v=>Number.isInteger(v)&&v>=0&&v<=255))throw Error('configuracion.js: color_eje_rgb debe contener tres enteros RGB entre 0 y 255, por ejemplo [0,128,0].');
+if(!Array.isArray(config.puntos_control))throw Error('configuracion.js: puntos_control debe ser un arreglo.');
+let anteriorTiempo=0,anteriorAbscisa=config.abscisa_inicio_m;
+for(const c of config.puntos_control){
+ if(!Number.isFinite(c.tiempo_segundos)||c.tiempo_segundos<=anteriorTiempo||!Number.isFinite(c.abscisa_m)||c.abscisa_m<=anteriorAbscisa||c.abscisa_m>=config.abscisa_fin_m)throw Error('Puntos de control inválidos: tiempo y abscisa deben ser crecientes y estar dentro del recorrido.');
+ anteriorTiempo=c.tiempo_segundos;anteriorAbscisa=c.abscisa_m;
+}
+document.querySelector('#control-info').textContent=config.puntos_control.length?'Controles: '+config.puntos_control.map(c=>abscisa(c.abscisa_m)+' · '+clock(c.tiempo_segundos)).join(' | '):'Sin puntos de control';
+const colorEje='rgb('+config.color_eje_rgb.join(',')+')';
+document.querySelector('#corridor-title').textContent=config.nombre_corredor;
+document.querySelector('#corridor-code').textContent='Código: '+config.codigo_via;
+document.querySelector('#corridor-range').textContent=abscisa(config.abscisa_inicio_m)+' – '+abscisa(config.abscisa_fin_m);
+document.title='Visor vial | '+config.codigo_via+' | '+config.nombre_corredor;
+chainage.textContent=abscisa(config.abscisa_inicio_m);
+let gj=window.VISOR_EJE;if(!gj)throw Error('No se pudo cargar datos/eje_vial.js');let lines=[];function add(g){if(!g)return;if(g.type==='LineString')lines.push(g.coordinates);else if(g.type==='MultiLineString')lines.push(...g.coordinates);else if(g.type==='GeometryCollection')g.geometries.forEach(add)}if(gj.type==='FeatureCollection')gj.features.forEach(f=>add(f.geometry));else if(gj.type==='Feature')add(gj.geometry);else add(gj);if(lines.length!==1)throw Error(`Se encontraron ${lines.length} segmentos. Prepara un único LineString continuo, ordenado Cañasgordas → Abriaquí.`);route=turf.lineString(lines[0]);totalKm=turf.length(route,{units:'kilometers'});if(!totalKm)throw Error('La geometría no tiene longitud');routeLayer=L.geoJSON(route,{style:{color:colorEje,weight:5}}).addTo(map);map.fitBounds(routeLayer.getBounds(),{padding:[24,24]});let start=lines[0][0],end=lines[0][lines[0].length-1];ends=[L.marker([start[1],start[0]]).addTo(map),L.marker([end[1],end[0]]).addTo(map)];updateEnds();marker=L.circleMarker([start[1],start[0]],{radius:9,color:'#fff',weight:3,fillColor:'#f59e0b',fillOpacity:1}).addTo(map);// PR georreferenciados del Shapefile, independientes de la interpolación temporal.
+if(config.mostrar_prs!==false){
+ const prs=window.VISOR_PRS;
+ if(!prs)throw Error('No se pudo cargar datos/prs.js');
+ const prColor='rgb('+((config.color_pr_rgb||[20,93,160]).join(','))+')';
+ prLayer=L.geoJSON(prs,{
+  filter:f=>f.geometry&&f.geometry.type==='Point'&&f.properties.codigo_via===config.codigo_via,
+  pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:6,color:'#ffffff',weight:2,fillColor:prColor,fillOpacity:1}),
+  onEachFeature:(f,layer)=>{
+   const n=f.properties.num_pr;
+   layer.bindTooltip('PR '+n,{permanent:true,direction:'top',offset:[0,-7],className:'pr-label'});
+   layer.bindPopup('<strong>PR '+n+'</strong><br>Abscisa: '+abscisa(f.properties.abscisa_m)+'<br>Código: '+f.properties.codigo_via);
+  }
+ }).addTo(map);
+ L.control.layers(null,{'Postes de referencia (PR)':prLayer},{collapsed:false}).addTo(map);
+}
+routeLayer.on('click',e=>{let clicked=turf.point([e.latlng.lng,e.latlng.lat]);let nearest=turf.nearestPointOnLine(route,clicked,{units:'kilometers'});let fraction=(reverse.checked?totalKm-nearest.properties.location:nearest.properties.location)/totalKm;let m=config.abscisa_inicio_m+fraction*(config.abscisa_fin_m-config.abscisa_inicio_m);seekTo(proporcionEnAbscisa(m))});status.textContent=`Eje vial cargado: ${totalKm.toFixed(3)} km geométricos. Abscisas configuradas: ${abscisa(config.abscisa_inicio_m)} a ${abscisa(config.abscisa_fin_m)}. Sincronización calibrada con ${config.puntos_control.length} punto(s) de control. El sentido inicial corresponde al orden de vértices del SHP; usa «Invertir sentido del eje» si no coincide con el video.`;render(position())}catch(e){status.textContent='Error: '+e.message;console.error(e)}}init();
+</script></body></html>
